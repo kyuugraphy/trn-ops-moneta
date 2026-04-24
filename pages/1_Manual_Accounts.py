@@ -13,13 +13,20 @@ from utils.categories import (
     get_grouped_subcats,
     get_subcat_descriptions,
 )
-from utils.db import fetch_manual_acc_data, is_db_configured, render_connection_debug, save_manual_acc_record
+from utils.db import (
+    fetch_manual_acc_data,
+    get_current_user,
+    is_db_configured,
+    render_connection_debug,
+    save_manual_acc_record,
+)
 from utils.mock_data import get_manual_acc_data
 from utils.styles import page_header, section_header
 from utils.validators import validate_iban, validate_ico, validate_rc
 
 PT_TP_OPTIONS = ["PO", "FOP", "FO"]
 DB_MODE = is_db_configured()
+
 
 def _init_form_state():
     defaults = {
@@ -32,8 +39,11 @@ def _init_form_state():
         "w_party_validity": 99,
         "w_purpose_subcat": "unclassified_general",
         "w_purpose_validity": 99,
+        "w_credit_purpose_flag": False,
+        "w_black_list_flag": False,
         "last_sel_idx": None,
         "acc_table_ver": 0,
+        "show_history": False,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -48,6 +58,23 @@ def _reset_table_selection():
     st.session_state["acc_table_ver"] += 1
 
 
+def _to_int_flag(val) -> int:
+    """Coerce mixed truthy inputs (0/1, bool, None, NaN) to an int 0/1 flag."""
+    if val is None:
+        return 0
+    try:
+        if pd.isna(val):
+            return 0
+    except (TypeError, ValueError):
+        pass
+    if isinstance(val, bool):
+        return int(val)
+    try:
+        return 1 if int(val) else 0
+    except (TypeError, ValueError):
+        return 0
+
+
 def _load_row_into_form(row: pd.Series):
     st.session_state["w_iban"] = str(row.get("IBAN", ""))
     st.session_state["w_uni_pt_key"] = str(row.get("UNI_PT_KEY", ""))
@@ -55,9 +82,11 @@ def _load_row_into_form(row: pd.Series):
     st.session_state["w_ico"] = str(row.get("ICO_NUM", ""))
     st.session_state["w_rc"] = str(row.get("RC_NUM", ""))
     st.session_state["w_party_subcat"] = str(row.get("PARTY_SUBCAT", "unclassified_general"))
-    st.session_state["w_party_validity"] = int(row.get("PARTY_SUBCAT_VALIDITY", 99))
+    st.session_state["w_party_validity"] = int(row.get("PARTY_SUBCAT_VALIDITY") or 99)
     st.session_state["w_purpose_subcat"] = str(row.get("PURPOSE_SUBCAT", "unclassified_general"))
-    st.session_state["w_purpose_validity"] = int(row.get("PURPOSE_SUBCAT_VALIDITY", 99))
+    st.session_state["w_purpose_validity"] = int(row.get("PURPOSE_SUBCAT_VALIDITY") or 99)
+    st.session_state["w_credit_purpose_flag"] = bool(_to_int_flag(row.get("CREDIT_PURPOSE_FLAG")))
+    st.session_state["w_black_list_flag"] = bool(_to_int_flag(row.get("BLACK_LIST_FLAG")))
 
 
 def _clear_form():
@@ -70,17 +99,25 @@ def _clear_form():
     st.session_state["w_party_validity"] = 99
     st.session_state["w_purpose_subcat"] = "unclassified_general"
     st.session_state["w_purpose_validity"] = 99
+    st.session_state["w_credit_purpose_flag"] = False
+    st.session_state["w_black_list_flag"] = False
 
 
 
 _init_form_state()
-df = fetch_manual_acc_data() if DB_MODE else get_manual_acc_data()
+show_history = st.session_state.get("show_history", False)
+if DB_MODE:
+    df = fetch_manual_acc_data(show_history=show_history)
+else:
+    df = get_manual_acc_data()
+    if not show_history and "IS_ACTIVE" in df.columns:
+        df = df[df["IS_ACTIVE"] == 1].copy()
 subcats = get_grouped_subcats()
 descs = get_subcat_descriptions()
 
 page_header("Manual Accounts", "Search, create, and edit manual account data entries")
 
-render_connection_debug(["manual_acc"])
+render_connection_debug(["manual_acc", "f406_account"])
 
 # Metrics
 with st.container(border=True):
@@ -102,24 +139,39 @@ with left_col:
         search_iban = sc1.text_input("Filter by IBAN", placeholder="e.g. CZ...")
         search_ico = sc2.text_input("Filter by ICO", placeholder="8 digits")
         search_rc = sc3.text_input("Filter by RC", placeholder="9-10 digits")
+        st.checkbox(
+            "Show history (include closed SCD-2 rows)",
+            key="show_history",
+            help="When off, only rows with IS_ACTIVE = 1 are shown.",
+        )
+
+    show_history = st.session_state["show_history"]
 
     if DB_MODE:
-        filtered = fetch_manual_acc_data(search_iban, search_ico, search_rc)
+        filtered = fetch_manual_acc_data(search_iban, search_ico, search_rc, show_history=show_history)
     else:
         filtered = df.copy()
         if search_iban and search_iban.strip():
             filtered = filtered[filtered["IBAN"].str.upper().str.contains(search_iban.strip().upper(), na=False)]
         if search_ico and search_ico.strip():
             filtered = filtered[filtered["ICO_NUM"].str.contains(search_ico.strip(), na=False)]
-        if search_rc and search_rc.strip():
-            filtered = filtered[filtered["RC_NUM"].str.contains(search_rc.strip(), na=False)]
+        if search_rc and search_rc.strip() and "RC_NUM" in filtered.columns:
+            filtered = filtered[filtered["RC_NUM"].fillna("").str.contains(search_rc.strip(), na=False)]
 
     st.markdown(f"**Results ({len(filtered)} records)**")
     st.caption("Use the checkboxes on the left to select a row for editing")
+    # Order per visible-column spec on Screen 1.
     display_cols = [
-        "IBAN", "UNI_PT_KEY", "PT_TP_ID", "ICO_NUM", "RC_NUM",
-        "PARTY_SUBCAT", "PARTY_CAT", "PURPOSE_SUBCAT", "PURPOSE_CAT",
+        "ICO_NUM", "RC_NUM",
+        "PARTY_SUBCAT_VALIDITY", "PURPOSE_SUBCAT_VALIDITY",
+        "PARTY_CAT", "PARTY_SUBCAT",
+        "PURPOSE_CAT", "PURPOSE_SUBCAT",
+        "IBAN",
+        "CREDIT_PURPOSE_FLAG", "BLACK_LIST_FLAG",
+        "UPDATED_AT",
     ]
+    if show_history:
+        display_cols += ["IS_ACTIVE", "VALID_FROM", "VALID_TO"]
     existing_cols = [c for c in display_cols if c in filtered.columns]
 
     # Cache the dataframe to prevent st.dataframe from losing selection on rerun
@@ -242,6 +294,12 @@ with right_col:
             disabled=is_purp_unc
         )
 
+        st.divider()
+        st.markdown("##### Flags")
+        f1, f2 = st.columns(2)
+        f1.checkbox("CREDIT_PURPOSE_FLAG", key="w_credit_purpose_flag")
+        f2.checkbox("BLACK_LIST_FLAG", key="w_black_list_flag")
+
         st.markdown("<br>", unsafe_allow_html=True)
 
         def on_clear_btn():
@@ -291,16 +349,15 @@ with right_col:
                     "UNI_PT_KEY": int(w_uni_pt_key),
                     "PT_TP_ID": pt_tp_id,
                     "ICO_NUM": st.session_state.get("w_ico", "").strip() if _ico_enabled else "",
-                    "RC_NUM": st.session_state.get("w_rc", "").strip() if _rc_enabled else "",
                     "PARTY_SUBCAT": party_sub,
                     "PARTY_CAT": party_cat,
                     "PARTY_SUBCAT_VALIDITY": 99 if _is_party_unc else int(st.session_state.get("w_party_validity", 99)),
                     "PURPOSE_SUBCAT": purp_sub,
                     "PURPOSE_CAT": purp_cat,
                     "PURPOSE_SUBCAT_VALIDITY": 99 if _is_purp_unc else int(st.session_state.get("w_purpose_validity", 99)),
-                    "CREATED_BY": "user",
-                    "CREATED_AT": datetime.now(),
-                    "UPDATED_AT": datetime.now(),
+                    "CREDIT_PURPOSE_FLAG": int(bool(st.session_state.get("w_credit_purpose_flag", False))),
+                    "BLACK_LIST_FLAG": int(bool(st.session_state.get("w_black_list_flag", False))),
+                    "CREATED_BY": get_current_user(),
                 }
 
                 idx = st.session_state.get("last_sel_idx")
@@ -310,30 +367,48 @@ with right_col:
                         search_iban,
                         search_ico,
                         search_rc,
+                        show_history=show_history,
                     )
                     st.session_state["form_success"] = (
                         "Record updated successfully!" if idx is not None else "New record created successfully!"
                     )
-                    if idx is None:
-                        _reset_table_selection()
-                        st.session_state["last_sel_idx"] = None
-                        _clear_form()
+                    _reset_table_selection()
+                    st.session_state["last_sel_idx"] = None
+                    _clear_form()
                 else:
+                    # Mock mode: simulate SCD-2 (close active row, append new row).
                     current_df = get_manual_acc_data()
-                    if idx is not None and idx in current_df.index:
-                        for col, val in new_row.items():
-                            current_df.at[idx, col] = val
-                        current_df.at[idx, "UPDATED_AT"] = datetime.now()
-                        st.session_state["manual_acc_data"] = current_df
-                        st.session_state["form_success"] = "Record updated successfully!"
-                    else:
-                        new_df = pd.DataFrame([new_row])
-                        st.session_state["manual_acc_data"] = pd.concat([current_df, new_df], ignore_index=True)
-                        st.session_state["form_success"] = "New record created successfully!"
+                    now = datetime.now()
+                    iban_val = new_row["IBAN"]
+                    mask_active = (current_df["IBAN"] == iban_val) & (
+                        current_df.get("IS_ACTIVE", pd.Series([1] * len(current_df))) == 1
+                    )
+                    if mask_active.any():
+                        current_df.loc[mask_active, "IS_ACTIVE"] = 0
+                        current_df.loc[mask_active, "VALID_TO"] = now
+                        current_df.loc[mask_active, "UPDATED_AT"] = now
 
-                        _reset_table_selection()
-                        st.session_state["last_sel_idx"] = None
-                        _clear_form()
+                    # Keep RC_NUM in the mock row (populated by JOIN in DB mode).
+                    new_row_mock = {
+                        **new_row,
+                        "RC_NUM": st.session_state.get("w_rc", "").strip() if _rc_enabled else "",
+                        "SRC": "MANUAL",
+                        "VALID_FROM": now,
+                        "VALID_TO": None,
+                        "IS_ACTIVE": 1,
+                        "CREATED_AT": now,
+                        "UPDATED_AT": now,
+                    }
+                    new_df = pd.DataFrame([new_row_mock])
+                    st.session_state["manual_acc_data"] = pd.concat(
+                        [current_df, new_df], ignore_index=True
+                    )
+                    st.session_state["form_success"] = (
+                        "Record updated successfully!" if idx is not None else "New record created successfully!"
+                    )
+                    _reset_table_selection()
+                    st.session_state["last_sel_idx"] = None
+                    _clear_form()
 
         b1, b2 = st.columns(2)
         with b1:

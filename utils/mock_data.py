@@ -95,6 +95,12 @@ def _rand_subcat() -> str:
 
 
 def generate_manual_acc_data(n: int = 12) -> pd.DataFrame:
+    """Generate mock rows whose schema mirrors `manual_acc_data_changes_new`
+    *post-migration* plus an extra `RC_NUM` column to simulate the f406 JOIN.
+
+    All generated rows are IS_ACTIVE=1 with VALID_TO=NULL. The UI's save flow
+    toggles them to IS_ACTIVE=0 when superseded.
+    """
     rows = []
     for i in range(n):
         pt_tp = _RNG.choice(["PO", "FOP", "FO"])
@@ -103,6 +109,7 @@ def generate_manual_acc_data(n: int = 12) -> pd.DataFrame:
         party_sub = _rand_subcat()
         purpose_sub = _rand_subcat()
         created = _rand_date()
+        updated = created + timedelta(days=_RNG.randint(0, 30))
         rows.append(
             {
                 "IBAN": _rand_iban(),
@@ -116,9 +123,15 @@ def generate_manual_acc_data(n: int = 12) -> pd.DataFrame:
                 "PURPOSE_SUBCAT": purpose_sub,
                 "PURPOSE_CAT": get_cat_for_subcat(purpose_sub),
                 "PURPOSE_SUBCAT_VALIDITY": _RNG.randint(50, 99),
+                "CREDIT_PURPOSE_FLAG": _RNG.choice([0, 0, 0, 1]),
+                "BLACK_LIST_FLAG": _RNG.choice([0, 0, 0, 0, 1]),
+                "SRC": _RNG.choice(["MANUAL", "F406", "BATCH"]),
+                "VALID_FROM": created,
+                "VALID_TO": None,
+                "IS_ACTIVE": 1,
                 "CREATED_BY": "system",
                 "CREATED_AT": created,
-                "UPDATED_AT": created + timedelta(days=_RNG.randint(0, 30)),
+                "UPDATED_AT": updated,
             }
         )
     return pd.DataFrame(rows)
