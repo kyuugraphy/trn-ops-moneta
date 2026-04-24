@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.streamlit/credentials.toml
+.streamlit/secrets.toml
+.venv/
+venv/
+env/
+.env
+.cursor/
+terminals/
+agent-transcripts/
+*test*.txt
