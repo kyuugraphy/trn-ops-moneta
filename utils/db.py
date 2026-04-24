@@ -24,7 +24,7 @@ _DEFAULT_SCHEMA = os.getenv("DATABRICKS_SCHEMA", "sol_risk_solution_demo")
 
 TABLE_DEFAULTS = {
     "manual_acc": f"{_DEFAULT_CATALOG}.{_DEFAULT_SCHEMA}.manual_acc_data_changes_new",
-    "f406_account": f"{_DEFAULT_CATALOG}.{_DEFAULT_SCHEMA}.f406_ads_risk_uni_pt_data",
+    "f406_account": f"{_DEFAULT_CATALOG}.landing_ads_f400.f406_ads_risk_uni_pt_data",
     "trn_classified": f"{_DEFAULT_CATALOG}.{_DEFAULT_SCHEMA}.trn_classified_12m_mini",
     "trn_validation": f"{_DEFAULT_CATALOG}.{_DEFAULT_SCHEMA}.trn_validation",
 }
