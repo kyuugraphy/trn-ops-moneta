@@ -23,7 +23,7 @@ _DEFAULT_CATALOG = os.getenv("DATABRICKS_CATALOG", "dtl_dev")
 _DEFAULT_SCHEMA = os.getenv("DATABRICKS_SCHEMA", "sol_risk_solution_demo")
 
 TABLE_DEFAULTS = {
-    "manual_acc": f"{_DEFAULT_CATALOG}.{_DEFAULT_SCHEMA}.manual_acc_data_changes_mini",
+    "manual_acc": f"{_DEFAULT_CATALOG}.{_DEFAULT_SCHEMA}.manual_acc_data_changes_new",
     "f406_account": f"{_DEFAULT_CATALOG}.{_DEFAULT_SCHEMA}.f406_ads_risk_uni_pt_data",
     "trn_classified": f"{_DEFAULT_CATALOG}.{_DEFAULT_SCHEMA}.trn_classified_12m_mini",
     "trn_validation": f"{_DEFAULT_CATALOG}.{_DEFAULT_SCHEMA}.trn_validation",
@@ -34,9 +34,15 @@ def get_table(key: str) -> str:
     """Return the current fully-qualified table name for *key*.
 
     Reads from session state (set by the sidebar configurator) with a
-    fallback to the env-based default.
+    fallback to the env-based default. Empty or whitespace-only overrides
+    (e.g. when the user clears the sidebar input) are ignored so we never
+    emit SQL like ``SELECT ... FROM `` with a blank table name.
     """
-    return st.session_state.get(f"tbl_{key}", TABLE_DEFAULTS[key])
+    default = TABLE_DEFAULTS[key]
+    override = st.session_state.get(f"tbl_{key}", default)
+    if not isinstance(override, str) or not override.strip():
+        return default
+    return override.strip()
 
 
 # ---------------------------------------------------------------------------
@@ -131,6 +137,12 @@ def render_connection_debug(table_keys: list[str]) -> None:
         else:
             for key in table_keys:
                 tbl = get_table(key)
+                if not tbl:
+                    st.error(
+                        f"Table name for **{key}** is empty — check the "
+                        "sidebar 'Table Configuration' override."
+                    )
+                    continue
                 try:
                     result = _read(f"SELECT COUNT(*) AS cnt FROM {tbl}")
                     cnt = result["cnt"].iloc[0]
@@ -138,29 +150,47 @@ def render_connection_debug(table_keys: list[str]) -> None:
                 except Exception as exc:
                     st.error(f"Query failed on `{tbl}`:\n```\n{exc}\n```")
 
-            trn_tbl = get_table("trn_classified")
-            try:
-                date_range = _read(
-                    f"SELECT MIN(SNAP_DATE) AS min_dt, MAX(SNAP_DATE) AS max_dt FROM {trn_tbl}"
-                )
-                st.info(
-                    f"SNAP_DATE range: **{date_range['min_dt'].iloc[0]}** → "
-                    f"**{date_range['max_dt'].iloc[0]}**"
-                )
-            except Exception as exc:
-                st.warning(f"Could not read SNAP_DATE range: {exc}")
+            if "trn_classified" in table_keys:
+                trn_tbl = get_table("trn_classified")
+                try:
+                    date_range = _read(
+                        f"SELECT MIN(SNAP_DATE) AS min_dt, MAX(SNAP_DATE) AS max_dt FROM {trn_tbl}"
+                    )
+                    st.info(
+                        f"SNAP_DATE range: **{date_range['min_dt'].iloc[0]}** → "
+                        f"**{date_range['max_dt'].iloc[0]}**"
+                    )
+                except Exception as exc:
+                    st.warning(f"Could not read SNAP_DATE range: {exc}")
 
-            val_tbl = get_table("trn_validation")
-            trn_tbl = get_table("trn_classified")
-            try:
-                test_join = _read(
-                    f"SELECT t.ACC_TRN_KEY FROM {trn_tbl} t "
-                    f"LEFT JOIN {val_tbl} v ON t.ACC_TRN_KEY = v.ACC_TRN_KEY "
-                    f"LIMIT 5"
-                )
-                st.success(f"JOIN test OK — returned **{len(test_join)}** rows")
-            except Exception as exc:
-                st.error(f"JOIN test failed:\n```\n{exc}\n```")
+            if "manual_acc" in table_keys and "f406_account" in table_keys:
+                try:
+                    acc_tbl = get_table("manual_acc")
+                    f406_tbl = get_table("f406_account")
+                    test_join = _read(
+                        f"SELECT m.IBAN, f.RC_NUM "
+                        f"FROM {acc_tbl} m "
+                        f"LEFT JOIN {f406_tbl} f ON f.UNI_PT_KEY = m.UNI_PT_KEY "
+                        f"WHERE m.IS_ACTIVE = 1 LIMIT 5"
+                    )
+                    st.success(
+                        f"manual_acc × f406 JOIN OK — {len(test_join)} active rows sampled"
+                    )
+                except Exception as exc:
+                    st.error(f"manual_acc × f406 JOIN test failed:\n```\n{exc}\n```")
+
+            if "trn_classified" in table_keys and "trn_validation" in table_keys:
+                val_tbl = get_table("trn_validation")
+                trn_tbl = get_table("trn_classified")
+                try:
+                    test_join = _read(
+                        f"SELECT t.ACC_TRN_KEY FROM {trn_tbl} t "
+                        f"LEFT JOIN {val_tbl} v ON t.ACC_TRN_KEY = v.ACC_TRN_KEY "
+                        f"LIMIT 5"
+                    )
+                    st.success(f"trn × trn_validation JOIN OK — {len(test_join)} rows")
+                except Exception as exc:
+                    st.error(f"trn × trn_validation JOIN test failed:\n```\n{exc}\n```")
 
 
 @contextmanager
@@ -195,80 +225,194 @@ def _write(sql: str, params: dict | None = None) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Screen 1 — Manual Account Data (MANUAL_ACC_DATA_CHANGES)
+# Screen 1 — Manual Account Data (manual_acc_data_changes_new)
+#
+# Storage contract
+# ----------------
+#   * The physical Delta table is SCD-2: each logical account may have many
+#     historical rows; at most one row per IBAN has IS_ACTIVE = 1.
+#   * VALID_FROM  -> when the row became active
+#     VALID_TO    -> when the row was superseded (NULL while active)
+#     IS_ACTIVE   -> 1 for the current row, 0 for history
+#   * CREATED_AT / UPDATED_AT / CREATED_BY are audit mirrors populated by this
+#     app (see databricks/migrations/001_alter_manual_acc_data_changes_new.sql).
+#   * RC_NUM is NOT stored on manual_acc; it is resolved at read time via a
+#     LEFT JOIN against f406_ads_risk_uni_pt_data on UNI_PT_KEY.
+#
+# Save semantics (one atomic Delta MERGE)
+# ---------------------------------------
+#   Using the classic "double source" SCD-2 pattern:
+#     * source row A carries merge_iban = :IBAN  -> WHEN MATCHED closes the
+#       currently active row for that IBAN (IS_ACTIVE = 0, VALID_TO = now).
+#     * source row B carries merge_iban = NULL   -> never matches, falls into
+#       WHEN NOT MATCHED and inserts the brand-new active row.
+#   A guard on the INSERT branch (s.merge_iban IS NULL) prevents the close-row
+#   source from ever producing a second INSERT when no active row pre-exists.
 # ---------------------------------------------------------------------------
 
+_MANUAL_ACC_BASE_COLUMNS = [
+    "IBAN", "UNI_PT_KEY", "PT_TP_ID", "ICO_NUM",
+    "PARTY_CAT", "PARTY_SUBCAT", "PARTY_SUBCAT_VALIDITY",
+    "PURPOSE_CAT", "PURPOSE_SUBCAT", "PURPOSE_SUBCAT_VALIDITY",
+    "CREDIT_PURPOSE_FLAG", "BLACK_LIST_FLAG",
+    "SRC", "VALID_FROM", "VALID_TO", "IS_ACTIVE",
+    "CREATED_AT", "UPDATED_AT", "CREATED_BY",
+]
+
+
+def _manual_acc_read_sql(where_clause: str, show_history: bool) -> str:
+    """Build the Screen-1 SELECT that joins f406 for RC_NUM and filters SCD-2."""
+    acc_table = get_table("manual_acc")
+    f406_table = get_table("f406_account")
+    active_filter = "" if show_history else "AND m.IS_ACTIVE = 1"
+    return f"""
+        WITH f406_latest AS (
+            SELECT UNI_PT_KEY, RC_NUM
+            FROM (
+                SELECT
+                    UNI_PT_KEY,
+                    RC_NUM,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY UNI_PT_KEY
+                        ORDER BY SNAP_DATE DESC
+                    ) AS rn
+                FROM {f406_table}
+                WHERE UNI_PT_KEY IS NOT NULL
+            )
+            WHERE rn = 1
+        )
+        SELECT
+            m.IBAN,
+            m.UNI_PT_KEY,
+            m.PT_TP_ID,
+            m.ICO_NUM,
+            f.RC_NUM,
+            m.PARTY_CAT,
+            m.PARTY_SUBCAT,
+            m.PARTY_SUBCAT_VALIDITY,
+            m.PURPOSE_CAT,
+            m.PURPOSE_SUBCAT,
+            m.PURPOSE_SUBCAT_VALIDITY,
+            m.CREDIT_PURPOSE_FLAG,
+            m.BLACK_LIST_FLAG,
+            m.SRC,
+            m.IS_ACTIVE,
+            m.VALID_FROM,
+            m.VALID_TO,
+            m.CREATED_AT,
+            m.UPDATED_AT,
+            m.CREATED_BY
+        FROM {acc_table} m
+        LEFT JOIN f406_latest f
+               ON f.UNI_PT_KEY = m.UNI_PT_KEY
+        WHERE {where_clause}
+          {active_filter}
+        ORDER BY m.UPDATED_AT DESC NULLS LAST, m.VALID_FROM DESC NULLS LAST
+        LIMIT 1000
+    """
+
+
 def fetch_manual_acc_data(
-    iban: str = "", ico: str = "", rc: str = "",
+    iban: str = "",
+    ico: str = "",
+    rc: str = "",
+    show_history: bool = False,
 ) -> pd.DataFrame:
-    """Query account data with optional partial-match filters."""
+    """Query Screen-1 account rows with optional partial-match filters.
+
+    Active-only by default; flip *show_history* to include closed SCD-2 rows.
+    RC_NUM is resolved via LEFT JOIN with f406 on UNI_PT_KEY.
+    """
     conditions = ["1=1"]
     params: dict = {}
 
     if iban.strip():
-        conditions.append("UPPER(IBAN) LIKE UPPER(%(iban)s)")
+        conditions.append("UPPER(m.IBAN) LIKE UPPER(%(iban)s)")
         params["iban"] = f"%{iban.strip()}%"
     if ico.strip():
-        conditions.append("ICO_NUM LIKE %(ico)s")
+        conditions.append("m.ICO_NUM LIKE %(ico)s")
         params["ico"] = f"%{ico.strip()}%"
     if rc.strip():
-        conditions.append("RC_NUM LIKE %(rc)s")
+        conditions.append("f.RC_NUM LIKE %(rc)s")
         params["rc"] = f"%{rc.strip()}%"
 
-    sql = f"""
-        SELECT *
-        FROM {get_table('manual_acc')}
-        WHERE {' AND '.join(conditions)}
-        ORDER BY UPDATED_AT DESC
-        LIMIT 1000
-    """
+    sql = _manual_acc_read_sql(" AND ".join(conditions), show_history)
     return _read(sql, params)
 
 
 def save_manual_acc_record(record: dict) -> None:
-    """MERGE (upsert) a single record keyed by UNI_PT_KEY."""
+    """Persist a Screen-1 form submission as an SCD-2 change on manual_acc.
+
+    One atomic MERGE: closes the currently active row for the IBAN (if any)
+    and inserts the new active row. SRC is forced to 'MANUAL'. VALID_FROM /
+    CREATED_AT / UPDATED_AT are stamped server-side with current_timestamp().
+
+    Required keys in *record*:
+        IBAN, UNI_PT_KEY, PT_TP_ID, ICO_NUM,
+        PARTY_CAT, PARTY_SUBCAT, PARTY_SUBCAT_VALIDITY,
+        PURPOSE_CAT, PURPOSE_SUBCAT, PURPOSE_SUBCAT_VALIDITY,
+        CREDIT_PURPOSE_FLAG, BLACK_LIST_FLAG, CREATED_BY
+    """
     sql = f"""
         MERGE INTO {get_table('manual_acc')} AS t
         USING (
             SELECT
-                %(IBAN)s                    AS IBAN,
-                CAST(%(UNI_PT_KEY)s AS BIGINT) AS UNI_PT_KEY,
-                %(PT_TP_ID)s                AS PT_TP_ID,
-                %(ICO_NUM)s                 AS ICO_NUM,
-                %(RC_NUM)s                  AS RC_NUM,
-                %(PARTY_SUBCAT)s            AS PARTY_SUBCAT,
-                %(PARTY_CAT)s               AS PARTY_CAT,
-                CAST(%(PARTY_SUBCAT_VALIDITY)s AS INT) AS PARTY_SUBCAT_VALIDITY,
-                %(PURPOSE_SUBCAT)s          AS PURPOSE_SUBCAT,
-                %(PURPOSE_CAT)s             AS PURPOSE_CAT,
-                CAST(%(PURPOSE_SUBCAT_VALIDITY)s AS INT) AS PURPOSE_SUBCAT_VALIDITY,
-                %(CREATED_BY)s              AS CREATED_BY,
-                CAST(%(CREATED_AT)s AS TIMESTAMP) AS CREATED_AT,
-                CAST(%(UPDATED_AT)s AS TIMESTAMP) AS UPDATED_AT
+                %(IBAN)s AS merge_iban,
+                %(IBAN)s AS IBAN,
+                CAST(%(UNI_PT_KEY)s AS BIGINT)            AS UNI_PT_KEY,
+                %(PT_TP_ID)s                              AS PT_TP_ID,
+                %(ICO_NUM)s                               AS ICO_NUM,
+                %(PARTY_CAT)s                             AS PARTY_CAT,
+                %(PARTY_SUBCAT)s                          AS PARTY_SUBCAT,
+                CAST(%(PARTY_SUBCAT_VALIDITY)s   AS DECIMAL(38,0)) AS PARTY_SUBCAT_VALIDITY,
+                %(PURPOSE_CAT)s                           AS PURPOSE_CAT,
+                %(PURPOSE_SUBCAT)s                        AS PURPOSE_SUBCAT,
+                CAST(%(PURPOSE_SUBCAT_VALIDITY)s AS DECIMAL(38,0)) AS PURPOSE_SUBCAT_VALIDITY,
+                CAST(%(CREDIT_PURPOSE_FLAG)s AS INT)      AS CREDIT_PURPOSE_FLAG,
+                CAST(%(BLACK_LIST_FLAG)s     AS INT)      AS BLACK_LIST_FLAG,
+                %(CREATED_BY)s                            AS CREATED_BY
+            UNION ALL
+            SELECT
+                CAST(NULL AS STRING) AS merge_iban,
+                %(IBAN)s AS IBAN,
+                CAST(%(UNI_PT_KEY)s AS BIGINT)            AS UNI_PT_KEY,
+                %(PT_TP_ID)s                              AS PT_TP_ID,
+                %(ICO_NUM)s                               AS ICO_NUM,
+                %(PARTY_CAT)s                             AS PARTY_CAT,
+                %(PARTY_SUBCAT)s                          AS PARTY_SUBCAT,
+                CAST(%(PARTY_SUBCAT_VALIDITY)s   AS DECIMAL(38,0)) AS PARTY_SUBCAT_VALIDITY,
+                %(PURPOSE_CAT)s                           AS PURPOSE_CAT,
+                %(PURPOSE_SUBCAT)s                        AS PURPOSE_SUBCAT,
+                CAST(%(PURPOSE_SUBCAT_VALIDITY)s AS DECIMAL(38,0)) AS PURPOSE_SUBCAT_VALIDITY,
+                CAST(%(CREDIT_PURPOSE_FLAG)s AS INT)      AS CREDIT_PURPOSE_FLAG,
+                CAST(%(BLACK_LIST_FLAG)s     AS INT)      AS BLACK_LIST_FLAG,
+                %(CREATED_BY)s                            AS CREATED_BY
         ) AS s
-        ON t.UNI_PT_KEY = s.UNI_PT_KEY
+        ON t.IBAN = s.merge_iban AND t.IS_ACTIVE = 1
         WHEN MATCHED THEN UPDATE SET
-            t.IBAN                    = s.IBAN,
-            t.PT_TP_ID               = s.PT_TP_ID,
-            t.ICO_NUM                = s.ICO_NUM,
-            t.RC_NUM                 = s.RC_NUM,
-            t.PARTY_SUBCAT           = s.PARTY_SUBCAT,
-            t.PARTY_CAT              = s.PARTY_CAT,
-            t.PARTY_SUBCAT_VALIDITY  = s.PARTY_SUBCAT_VALIDITY,
-            t.PURPOSE_SUBCAT         = s.PURPOSE_SUBCAT,
-            t.PURPOSE_CAT            = s.PURPOSE_CAT,
-            t.PURPOSE_SUBCAT_VALIDITY = s.PURPOSE_SUBCAT_VALIDITY,
-            t.UPDATED_AT             = s.UPDATED_AT
-        WHEN NOT MATCHED THEN INSERT (
-            IBAN, UNI_PT_KEY, PT_TP_ID, ICO_NUM, RC_NUM,
-            PARTY_SUBCAT, PARTY_CAT, PARTY_SUBCAT_VALIDITY,
-            PURPOSE_SUBCAT, PURPOSE_CAT, PURPOSE_SUBCAT_VALIDITY,
-            CREATED_BY, CREATED_AT, UPDATED_AT
+            t.IS_ACTIVE  = 0,
+            t.VALID_TO   = current_timestamp(),
+            t.UPDATED_AT = current_timestamp()
+        WHEN NOT MATCHED AND s.merge_iban IS NULL THEN INSERT (
+            IBAN, UNI_PT_KEY, PT_TP_ID, ICO_NUM,
+            PARTY_CAT, PARTY_SUBCAT, PARTY_SUBCAT_VALIDITY,
+            PURPOSE_CAT, PURPOSE_SUBCAT, PURPOSE_SUBCAT_VALIDITY,
+            CREDIT_PURPOSE_FLAG, BLACK_LIST_FLAG,
+            SRC, VALID_FROM, VALID_TO, IS_ACTIVE,
+            CREATED_AT, UPDATED_AT, CREATED_BY,
+            PRIMARYMD5
         ) VALUES (
-            s.IBAN, s.UNI_PT_KEY, s.PT_TP_ID, s.ICO_NUM, s.RC_NUM,
-            s.PARTY_SUBCAT, s.PARTY_CAT, s.PARTY_SUBCAT_VALIDITY,
-            s.PURPOSE_SUBCAT, s.PURPOSE_CAT, s.PURPOSE_SUBCAT_VALIDITY,
-            s.CREATED_BY, s.CREATED_AT, s.UPDATED_AT
+            s.IBAN, s.UNI_PT_KEY, s.PT_TP_ID, s.ICO_NUM,
+            s.PARTY_CAT, s.PARTY_SUBCAT, s.PARTY_SUBCAT_VALIDITY,
+            s.PURPOSE_CAT, s.PURPOSE_SUBCAT, s.PURPOSE_SUBCAT_VALIDITY,
+            s.CREDIT_PURPOSE_FLAG, s.BLACK_LIST_FLAG,
+            'MANUAL', current_timestamp(), NULL, 1,
+            current_timestamp(), current_timestamp(), s.CREATED_BY,
+            md5(concat_ws('|',
+                s.IBAN,
+                CAST(s.UNI_PT_KEY AS STRING),
+                CAST(unix_micros(current_timestamp()) AS STRING)
+            ))
         )
     """
     _write(sql, record)
